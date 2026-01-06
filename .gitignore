@@ -11,3 +11,5 @@ airflow/airflow.cfg
 airflow/airflow.db
 airflow.log
 aiflow
+start_airflow.sh
+nohup.out
