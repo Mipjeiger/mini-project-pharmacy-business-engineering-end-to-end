@@ -8,7 +8,8 @@ from io import BytesIO
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+load_dotenv(dotenv_path=env_path)
 
 
 # Create database engine
@@ -28,65 +29,9 @@ def get_db_engine():
     )
 
 
-# Read parqued file from MinIO
-def read_parquet_from_minio(minio_client, bucket_name, object_name):
-    try:
-        response = minio_client.get_object(bucket_name, object_name)
-
-        # Read data to BytesIO
-        data = BytesIO(response.read())  # BytesIO is needed for read data in memory
-
-        # Close the response to free up resources
-        response.close()
-        response.release_conn()
-
-        # Read parquet file into DataFrame
-        df = pd.read_parquet(data)
-        return df
-
-    except Exception as e:
-        print(f"Error reading parquet file from MinIO: {e}")
-        raise
-
-
-# Get all parquet files from a MinIO bucket
-def get_all_parquet_files(minio_client):
-    all_data = {}
-
-    try:
-        # List all buckets
-        buckets = minio_client.list_buckets()
-        print(f"Found buckets: {[bucket.name for bucket in buckets]}")
-
-        for bucket in buckets:
-            bucket_name = bucket.name
-            print(f"Processing bucket: {bucket_name}")
-            all_data[bucket_name] = {}
-
-            # List all objects in the bucket
-            objects = minio_client.list_objects(bucket_name, recursive=True)
-
-            for obj in objects:
-                if obj.object_name.endswith(".parquet"):
-                    print(f"Reading object: {obj.object_name}")
-                    try:
-                        df = read_parquet_from_minio(
-                            minio_client=minio_client,
-                            bucket_name=bucket_name,
-                            object_name=obj.object_name,
-                        )
-                        all_data[bucket_name][obj.object_name] = df
-                        print(f"Shape: {df.shape} for object: {obj.object_name}")
-                    except Exception as e:
-                        print(
-                            f"Failed to read {obj.object_name} from bucket {bucket_name}: {e}"
-                        )
-
-        return all_data
-
-    except Exception as e:
-        print(f"Error retrieving parquet files from MinIO: {e}")
-        raise
+# Read data parquet
+def read_parquet(file_path: str) -> pd.DataFrame:
+    return pd.read_parquet(file_path)
 
 
 # Callable example
@@ -99,25 +44,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Failed to create database engine: {e}")
 
-    print("Connecting to MinIO...")
+    print("Reading data from Parquet file...")
     try:
-        minio_client = minio.Minio(
-            f"{os.getenv('minio_host')}:{os.getenv('minio_port')}",
-            access_key=os.getenv("access_key"),
-            secret_key=os.getenv("secret_key"),
-            secure=False,
-        )
-        print("MinIO client created.")
-
-        # retrieve all parquet files
-        all_data = get_all_parquet_files(minio_client=minio_client)
-
-        # Show summary of data retrieved
-        for bucket_name, objects in all_data.items():
-            print(f"Bucket: {bucket_name}")
-            print(f"Total files retrieved: {len(objects)}")
-            for object_name, df in objects.items():
-                print(f" - {object_name}: {df.shape} ")
-
+        df = read_parquet("data/sales_feature_20260105_130925.parquet")
+        print("Data read from Parquet file:")
+        print(df)
     except Exception as e:
-        print(f"Failed to connect to MinIO or retrieve data: {e}")
+        print(f"Failed to read data from Parquet file: {e}")
