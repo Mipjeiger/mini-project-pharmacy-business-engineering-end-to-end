@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+import gc  # Garbage collector
 
 
 # Function to get project root and .env path
@@ -60,7 +61,13 @@ def get_db_engine():
     db_url = (
         f"postgresql+psycopg2://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
     )
-    return create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        pool_size=5,  # Limit connection pool
+        max_overflow=0,
+    )
 
 
 # Ensure minio bucket exist
@@ -107,7 +114,9 @@ def kafka_to_bronze():
 
     print("Reading from Kafka...")
     try:
-        for batch in consumer.read_batch(limit=1000, max_batches=5):
+        for batch in consumer.read_batch(
+            limit=1000, max_batches=5, group_id="airflow_sales_pipeline"
+        ):
             if not batch:
                 continue
 
@@ -120,6 +129,10 @@ def kafka_to_bronze():
             minio.put_object("bronze", filename, buffer, len(buffer.getbuffer()))
             print(f"✓ {filename}: {len(df)} records")
             count += 1
+
+            # Free memory
+            del df, buffer
+            gc.collect()
 
         print(f"✓ Created {count} files in bronze")
 
@@ -143,7 +156,7 @@ def bronze_to_silver():
             try:
                 response = minio.get_object("bronze", obj.object_name)
                 df = pd.read_parquet(io.BytesIO(response.read()))
-                response.close()  # Close connection after reading
+                response.close()
                 response.release_conn()
 
                 # Clean negative sales to prevent skewed analysis
@@ -161,9 +174,14 @@ def bronze_to_silver():
                 )
                 print(f"✓ {obj.object_name}: {len(df)} records")
 
+                # Free memory
+                del df, buffer
+                gc.collect()
+
             except Exception as e:
                 print(f"Error processing {obj.object_name}: {e}")
                 raise
+
         print(f"✓ Processed {len(objects)} files to silver bucket.")
     except Exception as e:
         print(f"Error in bronze_to_silver: {e}")
@@ -173,6 +191,7 @@ def bronze_to_silver():
 def silver_to_gold():
     """Create features and save to PostgreSQL"""
     from sqlalchemy import text
+    import time
 
     minio = get_minio_client()
     engine = get_db_engine()
@@ -199,11 +218,12 @@ def silver_to_gold():
 
         df = pd.concat(dfs, ignore_index=True)
         print(f"Total: {len(df)} records")
-        del dfs  # free memory
+        del dfs
+        gc.collect()
 
         # Aggregate feature
-        print("Creating feature...")
-        feature = (
+        print("Creating features...")
+        features = (
             df.groupby(
                 [
                     "distributor",
@@ -224,14 +244,13 @@ def silver_to_gold():
             )
             .reset_index()
         )
+
         # Clean outliers
-        sales_upper_bound = feature["total_sales"].quantile(0.95)
-        feature["total_sales_clean"] = feature["total_sales"].clip(
+        sales_upper_bound = features["total_sales"].quantile(0.95)
+        features["total_sales_clean"] = features["total_sales"].clip(
             lower=50, upper=sales_upper_bound
         )
-        del df  # delete dataframe to free memory
 
-        """Split data"""
         # Convert month to digit
         month_mapping = {
             "January": 1,
@@ -248,49 +267,50 @@ def silver_to_gold():
             "December": 12,
         }
 
-        # Time feature engineering for sorting and splitting by time
-        feature["year"] = feature["year"].astype(int)
-        feature["month"] = feature["month"].map(month_mapping)
-        feature = feature.sort_values(by=["distributor", "year", "month"])
+        features["year"] = features["year"].astype(int)
+        features["month"] = features["month"].map(month_mapping)
+        features = features.sort_values(by=["distributor", "year", "month"])
 
         # Feature engineering
         print("Engineering features...")
-        df = df.copy()
-        df = df.sort_values(["distributor", "city", "year", "month"])
-        grp = df.groupby(
-            ["distributor", "product_name", "city"]
-        )  # Factor for rolling calculations on lag features
+        features = features.sort_values(["distributor", "city", "year", "month"])
+        grp = features.groupby(["distributor", "product_name", "city"])
 
-        # Lag features - use values from previous months as sales past ago
-        df["lag_1m_sales"] = grp["total_sales_clean"].shift(1)
-        df["lag_3m_sales"] = grp["total_sales_clean"].shift(3)
-        df["lag_6m_sales"] = grp["total_sales_clean"].shift(6)
+        # Lag features
+        features["lag_1m_sales"] = grp["total_sales_clean"].shift(1)
+        features["lag_3m_sales"] = grp["total_sales_clean"].shift(3)
+        features["lag_6m_sales"] = grp["total_sales_clean"].shift(6)
         print("✓ Created lag features")
 
         # Rolling features
-        df["rolling_avg_3m"] = grp["total_sales_clean"].transform(
+        features["rolling_avg_3m"] = grp["total_sales_clean"].transform(
             lambda x: x.shift(1).rolling(window=3, min_periods=1).mean()
         )
-        df["rolling_avg_6m"] = grp["total_sales_clean"].transform(
+        features["rolling_avg_6m"] = grp["total_sales_clean"].transform(
             lambda x: x.shift(1).rolling(window=6, min_periods=1).mean()
         )
+
         # Growth percentage
-        df["sales_growth_pct"] = grp["total_sales_clean"].transform(
+        features["sales_growth_pct"] = grp["total_sales_clean"].transform(
             lambda x: x.pct_change().shift(1) * 100
         )
 
-        # Seasonal features (month encoding)
-        df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
-        df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+        # Seasonal features
+        features["month_sin"] = np.sin(2 * np.pi * features["month"] / 12)
+        features["month_cos"] = np.cos(2 * np.pi * features["month"] / 12)
 
         # Clean NaN
-        df = df.replace([np.inf, -np.inf], np.nan)
-        df = df.fillna(0)
+        features = features.replace([np.inf, -np.inf], np.nan)
+        features = features.fillna(0)
+
+        # Delete df to free memory
+        del df, grp
+        gc.collect()
 
         # Save to MinIO gold bucket
-        print(f"Saving {len(feature)} records to gold bucket...")
+        print(f"Saving {len(features)} records to gold bucket...")
         buffer = io.BytesIO()
-        feature.to_parquet(buffer, index=False)
+        features.to_parquet(buffer, index=False)
         buffer.seek(0)
 
         gold_filename = (
@@ -298,12 +318,13 @@ def silver_to_gold():
         )
         minio.put_object("gold", gold_filename, buffer, len(buffer.getbuffer()))
         print(f"✓ Saved to gold/{gold_filename}")
-        del buffer  # Free memory
+        del buffer
+        gc.collect()
 
-        # Save analytics version (aggregated summary)
+        # Save analytics version
         print("Creating analytics summary...")
         analytics = (
-            feature.groupby(["distributor", "city", "year", "month"])
+            features.groupby(["distributor", "city", "year", "month"])
             .agg(
                 total_quantity=("total_quantity", "sum"),
                 total_sales=("total_sales", "sum"),
@@ -330,34 +351,96 @@ def silver_to_gold():
         print(
             f"✓ Saved to analytics/{analytics_filename} ({len(analytics)} summary records)"
         )
-        del buffer_analytics, analytics  # Free memory
+        del buffer_analytics, analytics
+        gc.collect()
 
-        # Write to database in smaller batches
-        print(f"Writing {len(feature)} records to database...")
+        # Test database connection
+        try:
+            with engine.connect() as test_conn:
+                test_conn.execute(text("SELECT 1"))
+                print("✓ Database connection successful")
+        except Exception as e:
+            print(f"Database connection failed: {e}")
+            raise
 
-        batch_size = 1000
-        for i in range(0, len(feature), batch_size):
-            batch = feature.iloc[i : i + batch_size]
-            batch.to_sql(
-                "sales_feature",
-                engine,
-                schema="features",
-                if_exists="replace" if i == 0 else "append",
-                index=False,
-                method=None,
+        # Ensure schema exists
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("CREATE SCHEMA IF NOT EXISTS features"))
+                conn.commit()
+                print("✓ Schema 'features' ready")
+        except Exception as e:
+            print(f"Warning: Could not create schema: {e}")
+
+        # Write to database with MEMORY OPTIMIZATION
+        print(f"Writing {len(features)} records to database...")
+
+        # SMALLER batch size to reduce memory
+        batch_size = 300  # Reduced from 800
+        total_batches = (len(features) + batch_size - 1) // batch_size
+
+        for i in range(0, len(features), batch_size):
+            batch_num = i // batch_size + 1
+            batch = features.iloc[
+                i : i + batch_size
+            ].copy()  # Use copy to avoid warnings
+
+            print(
+                f"  Writing batch {batch_num}/{total_batches} ({len(batch)} records)..."
             )
-            print(f"  ✓ Batch {i//batch_size + 1}: {len(batch)} records")
-            del batch
+
+            try:
+                start_time = time.time()
+
+                # Use method=None instead of 'multi' to save memory
+                batch.to_sql(
+                    "sales_feature",
+                    engine,
+                    schema="features",
+                    if_exists="replace" if i == 0 else "append",
+                    index=False,
+                    method=None,  # Changed from 'multi' - uses less memory
+                    chunksize=50,  # Write in very small chunks
+                )
+
+                elapsed = time.time() - start_time
+                print(f"    ✓ Batch {batch_num} done in {elapsed:.2f}s")
+
+            except Exception as e:
+                print(f"    ✗ Error writing batch {batch_num}: {e}")
+                raise
+            finally:
+                del batch
+                gc.collect()  # Force garbage collection after each batch
 
         # Verify
-        with engine.connect() as conn:
-            count = conn.execute(
-                text("SELECT COUNT(*) FROM features.sales_feature")
-            ).scalar()
-            print(f"✓ Verified: {count} records in database")
+        print("Verifying database...")
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text("SELECT COUNT(*) FROM features.sales_feature")
+                )
+                count = result.scalar()
+                print(f"✓ Verified: {count} records in database")
 
+                if count != len(features):
+                    print(f"⚠️  Warning: Expected {len(features)}, got {count}")
+
+        except Exception as e:
+            print(f"✗ Verification error: {e}")
+
+        print("✓ silver_to_gold completed successfully")
+
+    except Exception as e:
+        print(f"Error in silver_to_gold: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
+        print("Cleaning up...")
         engine.dispose()
+        gc.collect()
 
 
 # DAG definition
@@ -367,7 +450,12 @@ with DAG(
     schedule=None,
     catchup=False,
     tags=["pharmacy", "etl"],
-    default_args={"owner": "airflow", "retries": 2, "retry_delay": 60},
+    default_args={
+        "owner": "airflow",
+        "retries": 2,
+        "retry_delay": 60,
+        # Add memory limits if using KubernetesExecutor
+    },
 ) as dag:
 
     t1 = PythonOperator(task_id="kafka_to_bronze", python_callable=kafka_to_bronze)

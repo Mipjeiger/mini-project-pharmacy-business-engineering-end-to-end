@@ -18,3 +18,4 @@ mc
 minio-data/.minio.sys
 .env.backup
 notebooks/catboost_info
+.vscode

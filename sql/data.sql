@@ -12,3 +12,6 @@ ADD COLUMN sales_growth_pct NUMERIC;
 SELECT DISTINCT year
 FROM raw.pharmacy_sales
 ORDER BY year DESC;
+
+SELECT COUNT(*) AS total_rows
+FROM features.sales_feature;
