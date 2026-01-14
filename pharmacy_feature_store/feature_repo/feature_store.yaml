@@ -1,3 +1,5 @@
+# Config file for Feast feature store
+
 project: pharmacy_sales # Project name
 registry: data/registry.db 
 provider: local 

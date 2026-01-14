@@ -1,3 +1,5 @@
+"""Feature definitions for the pharmacy sales feature store using Feast."""
+
 from feast import Entity, FeatureView, Field
 from feast.types import String, Float64, Int64
 from feast.value_type import ValueType

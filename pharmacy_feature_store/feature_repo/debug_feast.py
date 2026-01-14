@@ -1,3 +1,5 @@
+"""Debugging script for Feast feature store setup."""
+
 import sys
 import os
 from pathlib import Path
